@@ -1,0 +1,40 @@
+filebeat.inputs:
+  - type: filestream
+    id: spring-app-json
+    enabled: true
+    paths:
+      - /host-logs/app.log
+
+    parsers:
+      - ndjson:
+          add_error_key: true
+          expand_keys: true
+          overwrite_keys: true
+
+    # Attach your service/meta fields
+    fields_under_root: true
+    fields:
+      service.name: spring-app-elk-poc
+      service.environment: local
+      event.dataset: spring_app
+
+    # Tell Filebeat to write to a data stream
+    data_stream.dataset: spring_app
+    data_stream.namespace: local   # e.g., local / dev / prod
+
+processors:
+  - add_host_metadata: ~
+  - add_cloud_metadata: ~
+  - add_locale: ~
+
+# Kibana for `filebeat setup` (optional, but harmless to keep)
+setup.kibana:
+  host: ${KIBANA_HOST}
+  username: "elastic"
+  password: "changeme"
+
+# Output to ES; DO NOT set `index:` when using data streams
+output.elasticsearch:
+  hosts: ["${ELASTICSEARCH_HOST}"]
+  username: "elastic"
+  password: "changeme"

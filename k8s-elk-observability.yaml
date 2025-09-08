@@ -1,0 +1,316 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+  labels:
+    name: observability
+---
+# ===================== Elasticsearch (single-node, dev) =====================
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+  namespace: observability
+spec:
+  selector:
+    app: elasticsearch
+  ports:
+    - name: http
+      port: 9200
+      targetPort: 9200
+  type: ClusterIP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: elasticsearch-pvc
+  namespace: observability
+spec:
+  accessModes: [ "ReadWriteOnce" ]
+  resources:
+    requests:
+      storage: 15Gi
+  # storageClassName: standard # uncomment if your cluster requires an explicit class
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: elasticsearch
+  namespace: observability
+spec:
+  serviceName: elasticsearch
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+    spec:
+      containers:
+        - name: elasticsearch
+          image: docker.elastic.co/elasticsearch/elasticsearch:8.12.2
+          ports:
+            - containerPort: 9200
+            - containerPort: 9300
+          env:
+            - name: discovery.type
+              value: single-node
+            - name: ES_JAVA_OPTS
+              value: "-Xms512m -Xmx512m"
+            # Dev-only: disable auth/TLS for simplicity
+            - name: xpack.security.enabled
+              value: "false"
+          volumeMounts:
+            - name: es-data
+              mountPath: /usr/share/elasticsearch/data
+          readinessProbe:
+            httpGet: { path: /, port: 9200 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /, port: 9200 }
+            initialDelaySeconds: 40
+            periodSeconds: 20
+      volumes:
+        - name: es-data
+          persistentVolumeClaim:
+            claimName: elasticsearch-pvc
+---
+# ===================== Kibana =====================
+apiVersion: v1
+kind: Service
+metadata:
+  name: kibana
+  namespace: observability
+spec:
+  selector:
+    app: kibana
+  ports:
+    - name: http
+      port: 5601
+      targetPort: 5601
+  # For easy host access, expose as NodePort. Change to ClusterIP if you prefer port-forward.
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kibana
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kibana
+  template:
+    metadata:
+      labels:
+        app: kibana
+    spec:
+      containers:
+        - name: kibana
+          image: docker.elastic.co/kibana/kibana:8.12.2
+          ports:
+            - containerPort: 5601
+          env:
+            - name: ELASTICSEARCH_HOSTS
+              value: '["http://elasticsearch:9200"]'
+          readinessProbe:
+            httpGet: { path: /api/status, port: 5601 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /api/status, port: 5601 }
+            initialDelaySeconds: 40
+            periodSeconds: 20
+---
+# Optional: fix NodePort so you know it (else K8s will assign one)
+apiVersion: v1
+kind: Service
+metadata:
+  name: kibana-nodeport
+  namespace: observability
+spec:
+  selector:
+    app: kibana
+  ports:
+    - name: http
+      port: 5601
+      targetPort: 5601
+      nodePort: 30601    # change if taken (must be 30000–32767)
+  type: NodePort
+---
+# ===================== Filebeat (DaemonSet) =====================
+# RBAC so Filebeat can enrich logs with Kubernetes metadata
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: filebeat
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: filebeat
+rules:
+  - apiGroups: [ "" ]
+    resources: [ "pods", "namespaces", "nodes" ]
+    verbs: [ "get", "list", "watch" ]
+  - apiGroups: [ "apps" ]
+    resources: [ "replicasets" ]
+    verbs: [ "get", "list", "watch" ]
+  - nonResourceURLs: [ "/metrics" ]
+    verbs: [ "get" ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: filebeat
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: filebeat
+subjects:
+  - kind: ServiceAccount
+    name: filebeat
+    namespace: observability
+---
+# Filebeat config: filestream input on /var/log/containers, enrich with k8s metadata, output to ES
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: filebeat-config
+  namespace: observability
+data:
+  filebeat.yml: |
+    filebeat.inputs:
+      - type: filestream
+        id: container-logs
+        enabled: true
+        paths:
+          - /var/log/containers/*.log
+        prospector.scanner.symlinks: true
+        parsers:
+          - container:
+              stream: all
+
+        processors:
+          - add_kubernetes_metadata:
+              host: ${NODE_NAME}
+              matchers:
+                - logs_path:
+                    logs_path: /var/log/containers/
+
+    output.elasticsearch:
+      hosts: [ "http://elasticsearch:9200" ]
+
+    setup.template.enabled: true
+    setup.ilm.enabled: false
+
+    monitoring:
+      enabled: false
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: filebeat
+  namespace: observability
+  labels: { app: filebeat }
+spec:
+  selector:
+    matchLabels: { app: filebeat }
+  template:
+    metadata:
+      labels: { app: filebeat }
+    spec:
+      serviceAccountName: filebeat
+      terminationGracePeriodSeconds: 30
+      hostNetwork: false
+      dnsPolicy: ClusterFirst
+      containers:
+        - name: filebeat
+          image: docker.elastic.co/beats/filebeat:8.12.2
+          args: [ "-e", "-strict.perms=false" ]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef: { fieldPath: spec.nodeName }
+          securityContext:
+            runAsUser: 0    # needed to read host logs paths on some distros
+          volumeMounts:
+            - name: filebeat-config
+              mountPath: /usr/share/filebeat/filebeat.yml
+              subPath: filebeat.yml
+              readOnly: true
+            # Container logs (Docker/Containerd expose here)
+            - name: varlogcontainers
+              mountPath: /var/log/containers
+              readOnly: true
+            - name: varlogpods
+              mountPath: /var/log/pods
+              readOnly: true
+            # Docker runtime logs (Docker Desktop)
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+            # Kubelet pod info for metadata (symlinks)
+            - name: varlibkubeletpods
+              mountPath: /var/lib/kubelet/pods
+              readOnly: true
+            - name: varlibcontainerd
+              mountPath: /var/lib/containerd
+              readOnly: true
+            - name: runcontainerd
+              mountPath: /run/containerd
+              readOnly: true
+
+      volumes:
+        - name: filebeat-config
+          configMap:
+            name: filebeat-config
+            defaultMode: 0640
+        - name: varlogcontainers
+          hostPath: { path: /var/log/containers }
+        - name: varlogpods
+          hostPath: { path: /var/log/pods }
+        - name: varlibdockercontainers
+          hostPath: { path: /var/lib/docker/containers }
+        - name: varlibkubeletpods
+          hostPath: { path: /var/lib/kubelet/pods }
+        - name: varlibcontainerd
+          hostPath:
+            path: /var/lib/containerd
+        - name: runcontainerd
+          hostPath:
+            path: /run/containerd
+---
+# ===================== (Optional) NetworkPolicy: only allow retailpulse -> ES =====================
+# Label your 'retailpulse' namespace: kubectl label ns retailpulse name=retailpulse
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: es-allow-retailpulse-and-observability
+  namespace: observability
+spec:
+  podSelector:
+    matchLabels:
+      app: elasticsearch
+  policyTypes: [ "Ingress" ]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: retailpulse
+        - namespaceSelector:
+            matchLabels:
+              name: observability
+        - podSelector:
+            matchLabels:
+              app: filebeat
+      ports:
+        - protocol: TCP
+          port: 9200
+

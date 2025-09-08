@@ -1,0 +1,105 @@
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.2
+    container_name: es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=changeme
+      - KIBANA_PASSWORD=changeme
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      # succeed when TCP 9200 is accepting connections
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9200'"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.12.2
+    container_name: kib
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - ELASTICSEARCH_HOSTS=["http://elasticsearch:9200"]
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=changeme
+      - SERVER_PUBLICBASEURL=http://localhost:5601
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      - XPACK_SECURITY_ENCRYPTIONKEY=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      - XPACK_REPORTING_ENCRYPTIONKEY=cccccccccccccccccccccccccccccccc
+      - XPACK_FLEET_ENABLED=true
+      - XPACK_FLEET_PACKAGES=[{"name":"apm","version":"latest"}]
+      - XPACK_FLEET_AGENTS_ENABLED=true
+    ports:
+      - "5601:5601"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/5601'"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 60s
+
+  apm-server:
+    image: docker.elastic.co/apm/apm-server:8.12.2
+    container_name: apm
+    depends_on:
+      kibana:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    command:
+      - apm-server
+      - -e
+      - -E
+      - apm-server.host=0.0.0.0:8200
+      - -E
+      - apm-server.rum.enabled=true
+      - -E
+      - output.elasticsearch.hosts=["http://elasticsearch:9200"]
+      - -E
+      - output.elasticsearch.username=elastic
+      - -E
+      - output.elasticsearch.password=changeme
+      - -E
+      - apm-server.kibana.enabled=true
+      - -E
+      - apm-server.kibana.host=http://kibana:5601
+      - -E
+      - apm-server.kibana.username=elastic
+      - -E
+      - apm-server.kibana.password=changeme
+    ports:
+      - "8200:8200"
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.12.2
+    container_name: filebeat
+    user: root
+    depends_on:
+      kibana:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - ./filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - ./logs:/host-logs:ro
+      - filebeat-data:/usr/share/filebeat/data
+    environment:
+      - ELASTICSEARCH_HOST=http://elasticsearch:9200
+      - KIBANA_HOST=http://kibana:5601
+    command: ["filebeat", "-e", "-strict.perms=false"]
+
+volumes:
+  esdata:
+  filebeat-data:
