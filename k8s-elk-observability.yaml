@@ -303,7 +303,7 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels:
-              name: retailpulse
+              name: ns-retailpulse
         - namespaceSelector:
             matchLabels:
               name: observability
