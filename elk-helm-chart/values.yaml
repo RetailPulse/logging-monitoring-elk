@@ -54,10 +54,10 @@ filebeat:
   resources:
     limits:
       cpu: "200m"
-      memory: "200Mi"
+      memory: "2000Mi"
     requests:
       cpu: "50m"
-      memory: "100Mi"
+      memory: "1000Mi"
 
 networkpolicy:
   enabled: true
